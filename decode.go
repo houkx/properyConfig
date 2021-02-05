@@ -1,4 +1,4 @@
-package config
+package properyConfig
 
 import (
 	"fmt"
