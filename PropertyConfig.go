@@ -30,6 +30,7 @@ type PropertyConfig struct {
 	configUrl     string
 	observers     map[string][]ValueSetter
 	lastConfigs   map[string]string
+	vMapKeys      map[string]bool
 	lastVersion   string
 	isRestConfig  bool
 	scheduleTimer *time.Timer
@@ -43,11 +44,13 @@ func NewPropertyConfig(configUrl string, observers ...interface{}) (p *PropertyC
 
 	logger := log.New(os.Stdout, "INFO ", log.Lshortfile|log.Ldate|log.Ltime)
 	observersMap := make(map[string][]ValueSetter, 64)
+	vMapKeys := make(map[string]bool, 4)
 	for _, observer := range observers {
-		initValueSetter(logger, observer, observersMap)
+		initValueSetter(logger, observer, observersMap, vMapKeys)
 	}
 	p = &PropertyConfig{configUrl: configUrl,
 		observers:    observersMap,
+		vMapKeys:     vMapKeys,
 		logger:       logger,
 		isRestConfig: strings.HasPrefix(configUrl, "http"),
 		isJson:       false,
@@ -55,7 +58,7 @@ func NewPropertyConfig(configUrl string, observers ...interface{}) (p *PropertyC
 	logger.Println("configUrl =", configUrl)
 
 	// 初始通知
-	err = p.notifyObservers()
+	err = p.notifyObservers(false)
 	if err == nil {
 		for _, ob := range observers {
 			observer := reflect.ValueOf(ob)
@@ -78,7 +81,7 @@ func (p *PropertyConfig) ScheduleCheckUpdate(ctx context.Context) {
 		p.logger.Println("config Not checkUpdate!")
 		return
 	}
-	p.scheduleTimer = time.NewTimer(time.Minute)
+	p.scheduleTimer = time.NewTimer(time.Second)
 	p.running = true
 	go func() {
 		for ; p.running; {
@@ -89,8 +92,8 @@ func (p *PropertyConfig) ScheduleCheckUpdate(ctx context.Context) {
 			default:
 				runtime.Gosched()
 				<-p.scheduleTimer.C
-				p.notifyObservers()
-				p.scheduleTimer.Reset(time.Minute)
+				p.notifyObservers(true)
+				p.scheduleTimer.Reset(time.Second)
 			}
 		}
 		p.logger.Println("Stopped.")
@@ -135,7 +138,7 @@ func (m *MapStruct) Keys() []string {
 func (m *MapStruct) Map() map[string]string {
 	return m.m
 }
-func (p *PropertyConfig) notifyObservers() error {
+func (p *PropertyConfig) notifyObservers(isUpdate bool) error {
 	var cfgUrl = p.configUrl
 	if p.lastVersion != "" {
 		cfgUrl += "&v=" + p.lastVersion
@@ -185,9 +188,14 @@ func (p *PropertyConfig) notifyObservers() error {
 		}
 	}
 	curmap := hashMap.Map()
-	p.notifyChange(p.lastConfigs, curmap)
+	p.notifyChange(isUpdate, p.lastConfigs, curmap)
 	p.lastConfigs = curmap
 	return e
+}
+
+type KValUnion struct {
+	strVal string
+	mapVal map[string]string
 }
 
 /**
@@ -197,64 +205,74 @@ func (p *PropertyConfig) notifyObservers() error {
   @param oldConf - 旧的配置
   @param newConf - 新的配置
  */
-func (p *PropertyConfig) notifyChange(oldConf, newConf map[string]string) (countChangedConf int) {
-	//if conf.Kind() == reflect.Ptr {
-	//	conf = conf.Elem()
-	//}
+func (p *PropertyConfig) notifyChange(isUpdate bool, oldConf, newConf map[string]string) (countChangedConf int) {
 	// 用反射对比新旧两个对象的字段有哪些不同，然后归到变更的集合，最后通知所有的观察者
-	var changedConf map[string]string
+	var changedConf = make(map[string]KValUnion, len(newConf))
+	for k := range p.vMapKeys {
+		// 以新配置为基准，先用新的配置初始化mapK
+		if _, has := newConf[k]; !has {
+			pp := make(map[string]string, 4)
+		    filterStripPrefixInner(pp, newConf, k)
+			pp2 := make(map[string]string, 4)
+			if oldConf != nil {
+				filterStripPrefixInner(pp2, oldConf, k)
+			}
+			if !reflect.DeepEqual(pp, pp2) {
+				changedConf[k] = KValUnion{mapVal: pp}
+			}
+		}
+	}
 	if oldConf == nil || len(oldConf) == 0 {
-		// 旧的配置为空，为初始化的情况，每个setter方法都应该被调用
-		changedConf = newConf
-	} else if newConf != nil && len(newConf) > 0 {
-		changedConf = make(map[string]string, len(newConf))
+		for k, v := range newConf {
+			changedConf[k] = KValUnion{strVal: v}
+		}
+	} else {
+		// 判断新map的mapVal和旧的相比有没有修改, 若无修改则置空
 		// 以新配置为基准，处理修改和新增的情况
 		for k, v := range newConf {
-			if v2, existsOld := oldConf[k]; !existsOld || v != v2 {
-				changedConf[k] = v
+			if v2, has := oldConf[k]; !has || v != v2 {
+				changedConf[k] = KValUnion{strVal: v}
 			}
 		}
 		// 以旧配置为基准，处理删除的情况
-		for k, v := range oldConf {
-			if _, exists := newConf[k]; !exists {
-				changedConf[k] = v
+		for k := range oldConf {
+			if _, existsNew := newConf[k]; !existsNew {
+				changedConf[k] = KValUnion{strVal: ""}
 			}
 		}
-	} else {
+	}
+	if len(changedConf) == 0 {
 		return 0
 	}
-	setConfigValues(changedConf, p.observers)
+	setConfigValues(isUpdate, changedConf, p.observers)
+	fmt.Println("\n==========kPrevMap==============")
 	return len(changedConf)
 }
-func filterStripPrefix(p map[string]string, prefix string) *properties.Properties {
-	pp := properties.NewProperties()
+
+func filterStripPrefixInner(pp map[string]string, p map[string]string, prefix string) {
 	n := len(prefix)
 	for k, v := range p {
 		if len(k) > len(prefix) && strings.HasPrefix(k, prefix) {
-			pp.Set(k[n+1:], v)
+			pp[k[n+1:]] = v
 		}
 	}
-	return pp
 }
-func setConfigValues(conf map[string]string, vSet map[string][]ValueSetter) {
+func setConfigValues(isUpdate bool, conf map[string]KValUnion, vSet map[string][]ValueSetter) {
 	for k, vs := range vSet {
 		var hasK = false
-		vStr := os.Getenv(k)
-		if vStr != "" {
+		var vObj KValUnion
+		if vStr := os.Getenv(k); vStr != "" {
 			hasK = true
+			vObj = KValUnion{strVal: vStr}
 		} else {
-			vStr, hasK = conf[k]
-
+			vObj, hasK = conf[k]
 		}
 		if hasK {
 			for _, v := range vs {
-				v(vStr, nil)
+				v(vObj.strVal, vObj.mapVal)
 			}
-		} else if ps := filterStripPrefix(conf, k); ps.Len() > 0 {
-			for _, v := range vs {
-				v("", ps.Map())
-			}
-		} else {
+		} else if !isUpdate {
+			// 首次(初始化)的情况, 处理默认值
 			for _, v := range vs {
 				v("", nil)
 			}
@@ -262,7 +280,7 @@ func setConfigValues(conf map[string]string, vSet map[string][]ValueSetter) {
 	}
 }
 
-func initValueSetter(logger *log.Logger, observer interface{}, vSet map[string][]ValueSetter) {
+func initValueSetter(logger *log.Logger, observer interface{}, vSet map[string][]ValueSetter, vMapKeys map[string]bool) {
 	var t = reflect.TypeOf(observer).Elem()
 	if t.Kind() != reflect.Struct {
 		return
@@ -336,6 +354,9 @@ func initValueSetter(logger *log.Logger, observer interface{}, vSet map[string][
 				logger.Printf("WARN: %s/%s::%s \t%s\n", t.PkgPath(), t.Name(), f.Name, convertEr.Error())
 			}
 		}
+		if argType.Kind() == reflect.Map {
+			vMapKeys[propK] = true
+		}
 		if vs, hasK := vSet[propK]; hasK {
 			vSet[propK] = append(vs, ValueSetter(setter))
 		} else {
@@ -350,7 +371,7 @@ func keyDefaultValue(f reflect.StructField) (string, string, map[string]string) 
 		return "", "", nil
 	}
 	_key, _opts := parseTag(tag)
-
+	_key = strings.TrimSpace(_key)
 	var _def = ""
 	if d, ok := _opts["default"]; ok {
 		_def = d
