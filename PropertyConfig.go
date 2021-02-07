@@ -245,7 +245,6 @@ func (p *PropertyConfig) notifyChange(isUpdate bool, oldConf, newConf map[string
 		return 0
 	}
 	setConfigValues(isUpdate, changedConf, p.observers)
-	fmt.Println("\n==========kPrevMap==============")
 	return len(changedConf)
 }
 
