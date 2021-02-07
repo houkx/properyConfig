@@ -37,6 +37,7 @@ func TestConfig_api(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	ps.ScheduleCheckUpdateTime = time.Second // 定时检查周期设为1秒,方便测试配置文件变更
 	ctx, _ := context.WithCancel(context.Background())
 	//Loop: CheckUpdate
 	ps.ScheduleCheckUpdate(ctx)
