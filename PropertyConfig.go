@@ -26,16 +26,17 @@ type HMapI interface {
 
 type ValueSetter func(v string, vMap map[string]string)
 type PropertyConfig struct {
-	logger        *log.Logger
-	configUrl     string
-	observers     map[string][]ValueSetter
-	lastConfigs   map[string]string
-	vMapKeys      map[string]bool
-	lastVersion   string
-	isRestConfig  bool
-	scheduleTimer *time.Timer
-	running       bool
-	isJson        bool
+	logger                  *log.Logger
+	configUrl               string
+	observers               map[string][]ValueSetter
+	lastConfigs             map[string]string
+	vMapKeys                map[string]bool
+	lastVersion             string
+	isRestConfig            bool
+	ScheduleCheckUpdateTime time.Duration
+	scheduleTimer           *time.Timer
+	running                 bool
+	isJson                  bool
 }
 
 const CallInitMethod = "Init"
@@ -49,14 +50,14 @@ func NewPropertyConfig(configUrl string, observers ...interface{}) (p *PropertyC
 		initValueSetter(logger, observer, observersMap, vMapKeys)
 	}
 	p = &PropertyConfig{configUrl: configUrl,
-		observers:    observersMap,
-		vMapKeys:     vMapKeys,
-		logger:       logger,
-		isRestConfig: strings.HasPrefix(configUrl, "http"),
-		isJson:       false,
+		ScheduleCheckUpdateTime: time.Minute,
+		observers:               observersMap,
+		vMapKeys:                vMapKeys,
+		logger:                  logger,
+		isRestConfig:            strings.HasPrefix(configUrl, "http"),
+		isJson:                  false,
 	}
 	logger.Println("configUrl =", configUrl)
-
 	// 初始通知
 	err = p.notifyObservers(false)
 	if err == nil {
@@ -81,7 +82,7 @@ func (p *PropertyConfig) ScheduleCheckUpdate(ctx context.Context) {
 		p.logger.Println("config Not checkUpdate!")
 		return
 	}
-	p.scheduleTimer = time.NewTimer(time.Second)
+	p.scheduleTimer = time.NewTimer(p.ScheduleCheckUpdateTime)
 	p.running = true
 	go func() {
 		for ; p.running; {
@@ -93,7 +94,7 @@ func (p *PropertyConfig) ScheduleCheckUpdate(ctx context.Context) {
 				runtime.Gosched()
 				<-p.scheduleTimer.C
 				p.notifyObservers(true)
-				p.scheduleTimer.Reset(time.Second)
+				p.scheduleTimer.Reset(p.ScheduleCheckUpdateTime)
 			}
 		}
 		p.logger.Println("Stopped.")
@@ -206,13 +207,25 @@ type KValUnion struct {
   @param newConf - 新的配置
  */
 func (p *PropertyConfig) notifyChange(isUpdate bool, oldConf, newConf map[string]string) (countChangedConf int) {
+	if oldConf != nil && len(oldConf) == len(newConf) {
+		hasChange := false
+		for k, v := range newConf {
+			if v2, has := oldConf[k]; !has || v != v2 {
+				hasChange = true
+				break
+			}
+		}
+		if !hasChange {
+			return
+		}
+	}
 	// 用反射对比新旧两个对象的字段有哪些不同，然后归到变更的集合，最后通知所有的观察者
 	var changedConf = make(map[string]KValUnion, len(newConf))
 	for k := range p.vMapKeys {
 		// 以新配置为基准，先用新的配置初始化mapK
 		if _, has := newConf[k]; !has {
 			pp := make(map[string]string, 4)
-		    filterStripPrefixInner(pp, newConf, k)
+			filterStripPrefixInner(pp, newConf, k)
 			pp2 := make(map[string]string, 4)
 			if oldConf != nil {
 				filterStripPrefixInner(pp2, oldConf, k)
@@ -244,6 +257,7 @@ func (p *PropertyConfig) notifyChange(isUpdate bool, oldConf, newConf map[string
 	if len(changedConf) == 0 {
 		return 0
 	}
+	p.logger.Println("\n------- UpdateConfigs --------")
 	setConfigValues(isUpdate, changedConf, p.observers)
 	return len(changedConf)
 }
