@@ -174,6 +174,7 @@ func (p *PropertyConfig) notifyObservers(isUpdate bool) error {
 						hashMap = &MapStruct{m: mapObj}
 						jsonOk = true
 						p.isJson = true
+						e = nil
 					}
 				}
 			}
