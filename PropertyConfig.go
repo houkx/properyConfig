@@ -3,7 +3,7 @@ package properyConfig
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"github.com/magiconair/properties"
 	"io/ioutil"
 	"log"
@@ -12,18 +12,23 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
-/**
- 这个包主管配置注入和更新, 发生变更的配置会调用注册对象的set方法
- */
+type HMapI interface {
+	Get(key string) (string, bool)
+	MustGetString(key string) string
+	Keys() []string
+	Map() map[string]string
+}
+
+type ValueSetter func(v string, vMap map[string]string)
 type PropertyConfig struct {
 	logger        *log.Logger
 	configUrl     string
-	confType      reflect.Type
-	observers     []reflect.Value
+	observers     map[string][]ValueSetter
 	lastConfigs   map[string]string
 	lastVersion   string
 	isRestConfig  bool
@@ -33,32 +38,29 @@ type PropertyConfig struct {
 }
 
 const CallInitMethod = "Init"
-/**
- @configUrl -- 配置文件地址
- @confType -- 配置类,包含配置定义
- @observers -- 接口配置通知的观察者,会调用相应的Set方法
- */
-func NewPropertyConfig(configUrl string, confType reflect.Type, observers ...interface{}) (p *PropertyConfig, err error) {
+
+func NewPropertyConfig(configUrl string, observers ...interface{}) (p *PropertyConfig, err error) {
 
 	logger := log.New(os.Stdout, "INFO ", log.Lshortfile|log.Ldate|log.Ltime)
-	var vs = make([]reflect.Value, len(observers))
-	for i, observer := range observers {
-		vs[i] = reflect.ValueOf(observer)
+	observersMap := make(map[string][]ValueSetter, 64)
+	for _, observer := range observers {
+		initValueSetter(logger, observer, observersMap)
 	}
 	p = &PropertyConfig{configUrl: configUrl,
-		confType:     confType,
-		observers:    vs,
+		observers:    observersMap,
 		logger:       logger,
 		isRestConfig: strings.HasPrefix(configUrl, "http"),
 		isJson:       false,
 	}
 	logger.Println("configUrl =", configUrl)
+
 	// 初始通知
 	err = p.notifyObservers()
 	if err == nil {
-		for _, observer := range p.observers {
+		for _, ob := range observers {
+			observer := reflect.ValueOf(ob)
 			// 首次注入完配置, 调用每个观察者的 Init()方法
-			if mv := observer.MethodByName(CallInitMethod); mv.IsValid() {
+			if mv := observer.MethodByName(CallInitMethod); mv.IsValid() && mv.Type().NumIn() == 0 {
 				var tp = observer.Type().Elem()
 				p.logger.Printf("invoke: %s/%s:: %s()\n", tp.PkgPath(), tp.Name(), CallInitMethod)
 				mv.Call([]reflect.Value{})
@@ -182,22 +184,9 @@ func (p *PropertyConfig) notifyObservers() error {
 			p.lastVersion = url.PathEscape(version)
 		}
 	}
-	conf, e := DecodeNew(hashMap, p.confType)
-	if e == nil {
-		if errIface, isErr := conf.Interface().(error); isErr {
-			if errMsg := errIface.Error(); len(errMsg) > 0 {
-				p.logger.Println("configError:", errMsg)
-				e = errors.New(errMsg)
-			}
-		}
-		if e == nil {
-			curmap := hashMap.Map()
-			p.notifyChange(conf, p.lastConfigs, curmap)
-			p.lastConfigs = curmap
-		}
-	} else {
-		p.logger.Println("decodeConfigErr:", e)
-	}
+	curmap := hashMap.Map()
+	p.notifyChange(p.lastConfigs, curmap)
+	p.lastConfigs = curmap
 	return e
 }
 
@@ -208,62 +197,248 @@ func (p *PropertyConfig) notifyObservers() error {
   @param oldConf - 旧的配置
   @param newConf - 新的配置
  */
-func (p *PropertyConfig) notifyChange(conf reflect.Value, oldConf, newConf map[string]string) (int, int) {
-	if conf.Kind() == reflect.Ptr {
-		conf = conf.Elem()
-	}
+func (p *PropertyConfig) notifyChange(oldConf, newConf map[string]string) (countChangedConf int) {
+	//if conf.Kind() == reflect.Ptr {
+	//	conf = conf.Elem()
+	//}
 	// 用反射对比新旧两个对象的字段有哪些不同，然后归到变更的集合，最后通知所有的观察者
-	var changedPrefix map[string]string
+	var changedConf map[string]string
 	if oldConf == nil || len(oldConf) == 0 {
 		// 旧的配置为空，为初始化的情况，每个setter方法都应该被调用
-		numFields := conf.NumField()
-		changedPrefix = make(map[string]string, numFields)
-		for i := 0; i < numFields; i++ {
-			changedPrefix[conf.Type().Field(i).Name] = "1"
-		}
+		changedConf = newConf
 	} else if newConf != nil && len(newConf) > 0 {
-		changedPrefix = make(map[string]string)
+		changedConf = make(map[string]string, len(newConf))
 		// 以新配置为基准，处理修改和新增的情况
 		for k, v := range newConf {
 			if v2, existsOld := oldConf[k]; !existsOld || v != v2 {
-				changedPrefix[kPrev(k)] = "1"
+				changedConf[k] = v
 			}
 		}
 		// 以旧配置为基准，处理删除的情况
-		for k := range oldConf {
+		for k, v := range oldConf {
 			if _, exists := newConf[k]; !exists {
-				changedPrefix[kPrev(k)] = "0"
+				changedConf[k] = v
 			}
 		}
 	} else {
-		return 0, 0
+		return 0
 	}
-	var changes = 0
-	for prefix := range changedPrefix {
-		if field := conf.FieldByName(prefix); field.IsValid() {
-			if upper0 := strings.ToUpper(prefix[0:1]); upper0 != prefix[0:1] {
-				prefix = upper0 + prefix[1:]
+	setConfigValues(changedConf, p.observers)
+	return len(changedConf)
+}
+func filterStripPrefix(p map[string]string, prefix string) *properties.Properties {
+	pp := properties.NewProperties()
+	n := len(prefix)
+	for k, v := range p {
+		if len(k) > len(prefix) && strings.HasPrefix(k, prefix) {
+			pp.Set(k[n+1:], v)
+		}
+	}
+	return pp
+}
+func setConfigValues(conf map[string]string, vSet map[string][]ValueSetter) {
+	for k, vs := range vSet {
+		var hasK = false
+		vStr := os.Getenv(k)
+		if vStr != "" {
+			hasK = true
+		} else {
+			vStr, hasK = conf[k]
+
+		}
+		if hasK {
+			for _, v := range vs {
+				v(vStr, nil)
 			}
-			var setter = "Set" + prefix
-			for _, observer := range p.observers {
-				if mv := observer.MethodByName(setter); mv.IsValid() {
-					changes++
-					var tp = observer.Type().Elem()
-					var value = reflect.ValueOf(field.Interface())
-					p.logger.Printf("invoke: %s/%s:: %s (%+v)\n", tp.PkgPath(), tp.Name(), setter, value.Interface())
-					mv.Call([]reflect.Value{value})
+		} else if ps := filterStripPrefix(conf, k); ps.Len() > 0 {
+			for _, v := range vs {
+				v("", ps.Map())
+			}
+		} else {
+			for _, v := range vs {
+				v("", nil)
+			}
+		}
+	}
+}
+
+func initValueSetter(logger *log.Logger, observer interface{}, vSet map[string][]ValueSetter) {
+	var t = reflect.TypeOf(observer).Elem()
+	if t.Kind() != reflect.Struct {
+		return
+	}
+	var objV = reflect.ValueOf(observer)
+	for i, max := 0, t.NumField(); i < max; i++ {
+		var f = t.Field(i)
+		propK, def, opts := keyDefaultValue(f)
+		if propK == "" {
+			continue // 忽略没有 properties tag 的字段
+		}
+		prefix := f.Name
+		if upper0 := strings.ToUpper(prefix[0:1]); upper0 != prefix[0:1] {
+			prefix = upper0 + prefix[1:]
+		}
+		var setterMName = "Set" + prefix
+		var vSetter func(value reflect.Value)
+		var argType reflect.Type
+		if mv := objV.MethodByName(setterMName); mv.IsValid() && mv.Type().NumIn() == 1 {
+			// 方法参数类型
+			argType = mv.Type().In(0)
+			vSetter = func(value reflect.Value) {
+				logger.Printf("invoke: %s/%s.%s(%+v)\n", t.PkgPath(), t.Name(), setterMName, value.Interface())
+				mv.Call([]reflect.Value{value})
+			}
+		} else if fv := objV.Elem().Field(i); fv.CanSet() {
+			argType = fv.Type()
+			vSetter = func(value reflect.Value) {
+				logger.Printf("SetField: %s/%s.%s: %+v\n", t.PkgPath(), t.Name(), f.Name, value.Interface())
+				fv.Set(value)
+			}
+		} else {
+			continue
+		}
+		var setter = func(str string, mapv map[string]string) {
+			if str == "" {
+				str = def
+			}
+			var value reflect.Value
+			var convertEr error
+			if argType.Kind() != reflect.Map {
+				value, convertEr = convertValue(str, argType, opts)
+			} else {
+				var m = reflect.MakeMap(argType)
+				var vt = argType.Elem()
+				if mapv == nil {
+					tmpV := make(map[string]interface{}, 0)
+					mapv = make(map[string]string, 0)
+					convertEr = json.Unmarshal([]byte(str), &tmpV)
+					for k, v := range tmpV {
+						mapv[k] = fmt.Sprint(v)
+					}
+				}
+				if convertEr == nil {
+					for mk, v := range mapv {
+						ev, cer := convertValue(v, vt, opts)
+						if cer != nil {
+							convertEr = cer
+						} else {
+							m.SetMapIndex(reflect.ValueOf(mk), ev)
+						}
+					}
+				}
+				if convertEr == nil {
+					value = m
 				}
 			}
+			if convertEr == nil {
+				vSetter(value)
+			} else {
+				logger.Printf("WARN: %s/%s::%s \t%s\n", t.PkgPath(), t.Name(), f.Name, convertEr.Error())
+			}
+		}
+		if vs, hasK := vSet[propK]; hasK {
+			vSet[propK] = append(vs, ValueSetter(setter))
+		} else {
+			vs = make([]ValueSetter, 0, 3)
+			vSet[propK] = append(vs, ValueSetter(setter))
 		}
 	}
-	return len(changedPrefix), changes
 }
-func kPrev(k string) string {
-	var prefix string
-	if dot := strings.IndexByte(k, '.'); dot > 0 {
-		prefix = k[0:dot]
-	} else {
-		prefix = k
+func keyDefaultValue(f reflect.StructField) (string, string, map[string]string) {
+	tag := f.Tag.Get("properties")
+	if tag == "" {
+		return "", "", nil
 	}
-	return prefix
+	_key, _opts := parseTag(tag)
+
+	var _def = ""
+	if d, ok := _opts["default"]; ok {
+		_def = d
+	}
+	if _key == "" {
+		_key = f.Name
+	}
+	return _key, _def, _opts
+}
+
+// parseTag parses a "key,k=v,k=v,..."
+func parseTag(tag string) (key string, opts map[string]string) {
+	opts = map[string]string{}
+	for i, s := range strings.Split(tag, ",") {
+		if i == 0 {
+			key = s
+			continue
+		}
+
+		pp := strings.SplitN(s, "=", 2)
+		if len(pp) == 1 {
+			opts[pp[0]] = ""
+		} else {
+			opts[pp[0]] = pp[1]
+		}
+	}
+	return key, opts
+}
+
+func boolVal(v string) bool {
+	v = strings.ToLower(v)
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+//func isArray(t reflect.Type) bool    { return t.Kind() == reflect.Array || t.Kind() == reflect.Slice }
+func isBool(t reflect.Type) bool     { return t.Kind() == reflect.Bool }
+func isDuration(t reflect.Type) bool { return t == reflect.TypeOf(time.Second) }
+
+//func isMap(t reflect.Type) bool      { return t.Kind() == reflect.Map }
+//func isPtr(t reflect.Type) bool      { return t.Kind() == reflect.Ptr }
+func isString(t reflect.Type) bool { return t.Kind() == reflect.String }
+
+//func isStruct(t reflect.Type) bool   { return t.Kind() == reflect.Struct }
+func isTime(t reflect.Type) bool { return t == reflect.TypeOf(time.Time{}) }
+func isFloat(t reflect.Type) bool {
+	return t.Kind() == reflect.Float32 || t.Kind() == reflect.Float64
+}
+func isInt(t reflect.Type) bool {
+	return t.Kind() == reflect.Int || t.Kind() == reflect.Int8 || t.Kind() == reflect.Int16 || t.Kind() == reflect.Int32 || t.Kind() == reflect.Int64
+}
+func isUint(t reflect.Type) bool {
+	return t.Kind() == reflect.Uint || t.Kind() == reflect.Uint8 || t.Kind() == reflect.Uint16 || t.Kind() == reflect.Uint32 || t.Kind() == reflect.Uint64
+}
+func convertValue(s string, t reflect.Type, opts map[string]string) (val reflect.Value, err error) {
+	s = strings.TrimSpace(s)
+	var v interface{}
+
+	switch {
+	case isDuration(t):
+		v, err = time.ParseDuration(s)
+
+	case isTime(t):
+		layout := opts["layout"]
+		if layout == "" {
+			layout = time.RFC3339
+		}
+		v, err = time.Parse(layout, s)
+
+	case isBool(t):
+		v, err = boolVal(s), nil
+
+	case isString(t):
+		v, err = s, nil
+
+	case isFloat(t):
+		v, err = strconv.ParseFloat(s, 64)
+
+	case isInt(t):
+		v, err = strconv.ParseInt(s, 10, 64)
+
+	case isUint(t):
+		v, err = strconv.ParseUint(s, 10, 64)
+
+	default:
+		return reflect.Zero(t), fmt.Errorf("unsupported type %s", t)
+	}
+	if err != nil {
+		return reflect.Zero(t), err
+	}
+	return reflect.ValueOf(v).Convert(t), nil
 }
