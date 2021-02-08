@@ -295,13 +295,27 @@ func setConfigValues(isUpdate bool, conf map[string]KValUnion, vSet map[string][
 }
 
 func initValueSetter(logger *log.Logger, observer interface{}, vSet map[string][]ValueSetter, vMapKeys map[string]bool) {
-	var t = reflect.TypeOf(observer).Elem()
+
+	initValueSetterByVal(logger, reflect.ValueOf(observer), vSet, vMapKeys)
+}
+func initValueSetterByVal(logger *log.Logger, observer reflect.Value, vSet map[string][]ValueSetter, vMapKeys map[string]bool) {
+	var t = observer.Type()
+	var objV = observer
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
 	if t.Kind() != reflect.Struct {
 		return
 	}
-	var objV = reflect.ValueOf(observer)
 	for i, max := 0, t.NumField(); i < max; i++ {
 		var f = t.Field(i)
+		if f.Anonymous {
+			// 处理嵌套的结构体
+			if f.Type.Kind() == reflect.Struct {
+				initValueSetterByVal(logger, objV.Elem().Field(i).Addr(), vSet, vMapKeys)
+			}
+			continue
+		}
 		propK, def, opts := keyDefaultValue(f)
 		if propK == "" {
 			continue // 忽略没有 properties tag 的字段
